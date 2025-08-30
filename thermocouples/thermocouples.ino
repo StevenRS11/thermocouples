@@ -1,13 +1,15 @@
 /*
-  Thermolog v2.2 (ESP32-S3 + 6x MAX6675 + SD + SSD1306)
+  Thermolog v2.0 (ESP32-S3 + 6x MAX6675 + SD + SSD1306)
 
-  - Sensors: Adafruit MAX6675 library (bit-banged 3-wire: SCK, CS, SO)
-  - Display: Adafruit_SSD1306 (I2C), static UI + partial redraw for numbers
-  - Sensor polling every 0.5 s; display refresh every 0.5 s
-  - Logging ONLY every 5 s (configurable), append-only CSV + manifest
-  - 60-second batching (based on log interval), flush() after each batch
-  - Size-based rotation (~10 MB)
-  - Single button to start/stop recording; LED indicates state
+  - Thermocouples: Adafruit MAX6675 library (bit-banged 3-wire: SCK, CS, SO)
+    * No hardware SPI class used for thermocouples; avoids SD bus contention.
+  - SD logging on hardware SPI (SPI) with append-only CSV, manifest header.
+  - 60-second batching (samples every 5 s), flush() after each batch.
+  - Size-based rotation (~10 MB per file).
+  - Adafruit_SSD1306 (I2C) for live readout + recording timer.
+  - One button toggles recording; LED indicates state.
+
+  Adjust pin defines to your wiring.
 */
 
 #include <Arduino.h>
@@ -30,10 +32,12 @@
 #define SD_MOSI         23
 #define SD_CS           5
 
-// -------------------- Thermocouples (bit-banged) --------------------
-#define TC_SCK          26     // shared SCK to all MAX6675
-#define TC_SO           27     // shared SO/DO from MAX6675 to ESP32
-const int TC_CS[6] = { 12, 13, 14, 15, 16, 17 };   // unique CS per board
+// -------------------- Thermocouples (bit-banged via Adafruit lib) ----
+// Library uses pins directly: MAX6675(SCK, CS, SO)
+#define TC_SCK          20     // shared SCK to all MAX6675
+#define TC_SO           21     // shared SO/DO from MAX6675 to ESP32
+// Unique CS per thermocouple breakout:
+const int TC_CS[6] = { 12, 13, 14, 15, 16, 17 };
 
 // -------------------- UI pins --------------------
 #define PIN_BUTTON      36     // active-LOW, uses INPUT_PULLUP
@@ -44,14 +48,11 @@ const int TC_CS[6] = { 12, 13, 14, 15, 16, 17 };   // unique CS per board
 #define SCREEN_HEIGHT  64
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-// -------------------- Cadence / Batching / Rotation --------------------
-#define SENSOR_INTERVAL_MS   500     // <-- sensor read cadence (0.5 s)
-#define DISPLAY_INTERVAL_MS  500     // <-- display refresh cadence (0.5 s)
-#define LOG_INTERVAL_MS      5000    // <-- write to CSV every 5 s (make configurable)
-#define BATCH_WINDOW_MS      60000   // flush once per minute by default
-
-static const uint8_t  BATCH_MAX_LINES = (BATCH_WINDOW_MS / LOG_INTERVAL_MS); // ~12 at 5s
-static const uint32_t ROTATE_BYTES    = 10UL * 1024UL * 1024UL;              // ~10 MB
+// -------------------- Sampling / Batching / Rotation --------------------
+static const uint32_t SAMPLE_INTERVAL_MS = 5000;    // every 5 s
+static const uint32_t BATCH_WINDOW_MS    = 60000;   // flush every 60 s
+static const uint8_t  BATCH_MAX_LINES    = BATCH_WINDOW_MS / SAMPLE_INTERVAL_MS; // 12
+static const uint32_t ROTATE_BYTES       = 10UL * 1024UL * 1024UL;               // ~10 MB
 
 // -------------------- App State --------------------
 enum RecState { IDLE, RECORDING };
@@ -62,11 +63,10 @@ static char     sessionPath[128] = {0};
 static char     sessionDir[64]   = {0};
 static char     sessionFile[64]  = {0};
 
-static uint32_t recStartMs    = 0;
-static uint32_t lastSensorMs  = 0;
-static uint32_t lastDisplayMs = 0;
-static uint32_t lastLogMs     = 0;
-static uint32_t lastBatchMs   = 0;
+static uint32_t appStartMs   = 0;
+static uint32_t recStartMs   = 0;
+static uint32_t lastSampleMs = 0;
+static uint32_t lastBatchMs  = 0;
 
 // Button debounce
 static bool     lastBtnLevel        = HIGH;
@@ -78,12 +78,9 @@ static const uint32_t DEBOUNCE_MS   = 40;
 static char lineFmtBuf[96];
 static char smallBuf[48];
 
-// Batch buffer (stores ONLY log lines, not every 0.5s sample)
+// Batch buffer
 static char    batchBuf[BATCH_MAX_LINES][96];
 static uint8_t batchCount = 0;
-
-// Latest temperatures snapshot for UI/logging
-static float latestTemps[6] = {NAN, NAN, NAN, NAN, NAN, NAN};
 
 // -------------------- MAX6675 objects (bit-banged) --------------------
 MAX6675 tc0(TC_SCK, TC_CS[0], TC_SO);
@@ -92,22 +89,14 @@ MAX6675 tc2(TC_SCK, TC_CS[2], TC_SO);
 MAX6675 tc3(TC_SCK, TC_CS[3], TC_SO);
 MAX6675 tc4(TC_SCK, TC_CS[4], TC_SO);
 MAX6675 tc5(TC_SCK, TC_CS[5], TC_SO);
-MAX6675* TCs[6] = { &tc0, &tc1, &tc2, &tc3, &tc4, &tc5 };
 
-// -------------------- Layout for partial redraw --------------------
-static const int LABEL_COL[2] = { 0, 64 };      // two columns
-static const int ROW_Y[3]     = { 12, 28, 44 }; // three rows (~16 px)
-static const int NUM_X_OFFSET = 28;
-static const int NUM_W        = 34;
-static const int NUM_H        = 12;
-static const int FOOTER_Y     = 56;
+MAX6675* TCs[6] = { &tc0, &tc1, &tc2, &tc3, &tc4, &tc5 };
 
 // -------------------- Forward Declarations --------------------
 bool   initDisplay();
-void   drawStaticUI();
-void   updateDynamicUI(const float tempsC[6], bool recording, uint32_t elapsedMs);
-
+void   drawScreen(const float tempsC[6], bool recording, uint32_t elapsedMs);
 bool   initSD();
+
 bool   readMAX6675CelsiusIdx(int idx, float &outC);
 
 bool   openNewSessionFile(bool isRotation);
@@ -133,7 +122,6 @@ void setup() {
   // I2C (OLED)
   Wire.begin(I2C_SDA, I2C_SCL);
   initDisplay();
-  drawStaticUI();
 
   // UI
   pinMode(PIN_BUTTON, INPUT_PULLUP);
@@ -145,58 +133,62 @@ void setup() {
   pinMode(SD_CS, OUTPUT);
   digitalWrite(SD_CS, HIGH);
 
-  // Thermocouple pins
-  for (int i = 0; i < 6; ++i) { pinMode(TC_CS[i], OUTPUT); digitalWrite(TC_CS[i], HIGH); }
-  pinMode(TC_SCK, OUTPUT); digitalWrite(TC_SCK, LOW);
+  // Thermocouple CS pins default HIGH
+  for (int i = 0; i < 6; ++i) {
+    pinMode(TC_CS[i], OUTPUT);
+    digitalWrite(TC_CS[i], HIGH);
+  }
+  // Shared SCK/SO pins
+  pinMode(TC_SCK, OUTPUT);
+  digitalWrite(TC_SCK, LOW);
   pinMode(TC_SO, INPUT);
-
-  uint32_t now = millis();
-  lastSensorMs  = now;
-  lastDisplayMs = now;
-  lastLogMs     = now;
-  lastBatchMs   = now;
-
-  // Initial UI numbers/footers
-  updateDynamicUI(latestTemps, false, 0);
 
   if (!initSD()) {
     Serial.println("SD init failed; realtime works but recording will fail.");
   }
+
+  appStartMs   = millis();
+  lastSampleMs = appStartMs;
+  lastBatchMs  = appStartMs;
+  state        = IDLE;
+
+  // Splash
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println(F("Thermolog v2.0"));
+  display.println(F("Ready. Press BTN"));
+  display.println(F("to start logging."));
+  display.display();
 }
 
 void loop() {
-  uint32_t now = millis();
-
-  // --- Sensor poll @ 0.5 s ---
-  if (now - lastSensorMs >= SENSOR_INTERVAL_MS) {
-    lastSensorMs = now;
-    for (int i = 0; i < 6; ++i) {
-      float t;
-      if (!readMAX6675CelsiusIdx(i, t)) t = NAN;
-      latestTemps[i] = t;
-    }
+  // Read all temps via Adafruit library
+  float tempsC[6];
+  for (int i = 0; i < 6; ++i) {
+    if (!readMAX6675CelsiusIdx(i, tempsC[i])) tempsC[i] = NAN;
   }
 
-  // --- Display refresh @ 0.5 s ---
-  if (now - lastDisplayMs >= DISPLAY_INTERVAL_MS) {
-    uint32_t elapsed = (state == RECORDING) ? (now - recStartMs) : 0;
-    updateDynamicUI(latestTemps, state == RECORDING, elapsed);
-    lastDisplayMs = now;
-  }
+  // UI
+  uint32_t elapsed = (state == RECORDING) ? (millis() - recStartMs) : 0;
+  drawScreen(tempsC, state == RECORDING, elapsed);
 
-  // --- Button toggle ---
+  // Button
   if (buttonPressedEdge()) setRecording(state != RECORDING);
 
-  // --- Logging only on LOG_INTERVAL_MS when recording ---
+  const uint32_t now = millis();
+
+  // Sampling & batching
   if (state == RECORDING) {
-    if (now - lastLogMs >= LOG_INTERVAL_MS) {
-      lastLogMs = now;
-      uint32_t seq = (now - recStartMs) / LOG_INTERVAL_MS;
+    if (now - lastSampleMs >= SAMPLE_INTERVAL_MS) {
+      lastSampleMs = now;
+      uint32_t seq = (now - recStartMs) / SAMPLE_INTERVAL_MS;
       uint32_t elapsedMs = now - recStartMs;
 
-      if (!appendLineToBatch(latestTemps, elapsedMs, seq)) {
+      if (!appendLineToBatch(tempsC, elapsedMs, seq)) {
         if (flushBatchToFile()) {
-          appendLineToBatch(latestTemps, elapsedMs, seq);
+          appendLineToBatch(tempsC, elapsedMs, seq);
         } else {
           Serial.println("Batch flush failed; stopping recording.");
           setRecording(false);
@@ -204,7 +196,6 @@ void loop() {
       }
     }
 
-    // flush batch every minute (or full)
     if ((now - lastBatchMs >= BATCH_WINDOW_MS) || (batchCount >= BATCH_MAX_LINES)) {
       if (!flushBatchToFile()) {
         Serial.println("Batch flush failed; stopping recording.");
@@ -216,11 +207,11 @@ void loop() {
     }
   }
 
-  delay(10);
+  delay(40);
 }
 
 // ======================================================================
-// Display
+// Display (Adafruit_GFX + Adafruit_SSD1306)
 // ======================================================================
 bool initDisplay() {
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
@@ -231,14 +222,14 @@ bool initDisplay() {
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0,0);
-  display.println(F("Thermolog v2.2"));
+  display.println(F("Thermolog v2.0"));
   display.println(F("Booting..."));
   display.display();
-  delay(200);
+  delay(250);
   return true;
 }
 
-void drawStaticUI() {
+void drawScreen(const float tempsC[6], bool recording, uint32_t elapsedMs) {
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
@@ -247,49 +238,29 @@ void drawStaticUI() {
   display.setCursor(0, 0);
   display.println(F("MAX6675 x6 (C)"));
 
-  // Channel labels "T1:".."T6:"
+  // 3 rows x 2 columns
   for (int i = 0; i < 6; ++i) {
-    int col = LABEL_COL[i % 2];
-    int row = ROW_Y[i / 2];
+    int col = (i % 2) * 64;
+    int row = 12 + (i / 2) * 16;
     display.setCursor(col, row);
-    display.print("T");
-    display.print(i + 1);
-    display.print(":");
-  }
 
-  display.display();
-}
-
-void updateDynamicUI(const float tempsC[6], bool recording, uint32_t elapsedMs) {
-  for (int i = 0; i < 6; ++i) {
-    int col = LABEL_COL[i % 2];
-    int row = ROW_Y[i / 2];
-
-    int nx = col + NUM_X_OFFSET;
-    int ny = row;
-    display.fillRect(nx, ny, NUM_W, NUM_H, SSD1306_BLACK);
-
-    display.setCursor(nx, ny);
     if (isnan(tempsC[i])) {
-      display.print(F("---"));
+      snprintf(lineFmtBuf, sizeof(lineFmtBuf), "T%d: ---", i + 1);
     } else {
-      char buf[16];
-      dtostrf(tempsC[i], 6, 2, buf);
-      display.print(buf);
+      snprintf(lineFmtBuf, sizeof(lineFmtBuf), "T%d:%6.2f", i + 1, tempsC[i]);
     }
+    display.print(lineFmtBuf);
   }
 
   // Footer
-  display.fillRect(0, FOOTER_Y, SCREEN_WIDTH, SCREEN_HEIGHT - FOOTER_Y, SSD1306_BLACK);
-  display.setCursor(0, FOOTER_Y);
+  display.setCursor(0, 56);
   if (recording) {
     uint32_t secs = elapsedMs / 1000;
     uint32_t mm = secs / 60;
     uint32_t ss = secs % 60;
-    char tbuf[16];
-    snprintf(tbuf, sizeof(tbuf), "%02lu:%02lu", (unsigned long)mm, (unsigned long)ss);
-    display.print(F("REC "));
-    display.print(tbuf);
+    snprintf(lineFmtBuf, sizeof(lineFmtBuf), "REC %02lu:%02lu",
+             (unsigned long)mm, (unsigned long)ss);
+    display.print(lineFmtBuf);
   } else {
     display.print(F("IDLE"));
   }
@@ -298,9 +269,10 @@ void updateDynamicUI(const float tempsC[6], bool recording, uint32_t elapsedMs) 
 }
 
 // ======================================================================
-// SD / Session / CSV (append-only, manifest, batching on log cadence)
+// SD / Session / CSV (append-only, manifest, 60 s batching)
 // ======================================================================
 bool initSD() {
+  // SD on SPI bus
   if (!SD.begin(SD_CS, SPI, 25000000)) {
     if (!SD.begin(SD_CS, SPI, 8000000)) return false;
   }
@@ -314,17 +286,20 @@ bool hasRealTime(time_t *nowOut) {
 }
 
 void formatDate(char *dst, size_t n, time_t t) {
-  struct tm tmv; localtime_r(&t, &tmv);
+  struct tm tmv;
+  localtime_r(&t, &tmv);
   strftime(dst, n, "%Y-%m-%d", &tmv);
 }
 
 void formatTime(char *dst, size_t n, time_t t) {
-  struct tm tmv; localtime_r(&t, &tmv);
+  struct tm tmv;
+  localtime_r(&t, &tmv);
   strftime(dst, n, "%H-%M-%S", &tmv);
 }
 
 void buildSessionPaths() {
   strcpy(sessionDir, "/logs");
+
   time_t now;
   if (hasRealTime(&now)) {
     char dateStr[16], timeStr[16];
@@ -337,6 +312,7 @@ void buildSessionPaths() {
     strcpy(sessionDir, "/logs");
     snprintf(sessionFile, sizeof(sessionFile), "SESSION_ms%lu.csv", (unsigned long)ms);
   }
+
   if (!SD.exists(sessionDir)) SD.mkdir(sessionDir);
   snprintf(sessionPath, sizeof(sessionPath), "%s/%s", sessionDir, sessionFile);
 }
@@ -349,8 +325,14 @@ bool openNewSessionFile(bool isRotation) {
   if (isRotation) {
     for (int i = 1; i <= 99; ++i) {
       snprintf(smallBuf, sizeof(smallBuf), "%s/%.*s_%02d.csv",
-               sessionDir, (int)strlen(sessionFile) - 4, sessionFile, i);
-      if (!SD.exists(smallBuf)) { strncpy(sessionPath, smallBuf, sizeof(sessionPath)); sessionPath[sizeof(sessionPath)-1]='\0'; break; }
+               sessionDir,
+               (int)strlen(sessionFile) - 4, sessionFile,
+               i);
+      if (!SD.exists(smallBuf)) {
+        strncpy(sessionPath, smallBuf, sizeof(sessionPath));
+        sessionPath[sizeof(sessionPath)-1] = '\0';
+        break;
+      }
     }
   }
 
@@ -360,8 +342,9 @@ bool openNewSessionFile(bool isRotation) {
   // Manifest header
   time_t now;
   bool timeOk = hasRealTime(&now);
+
   logFile.println(F("# manifest_begin"));
-  logFile.println(F("# firmware: Thermolog v2.2"));
+  logFile.println(F("# firmware: Thermolog v2.0"));
   if (timeOk) {
     char dateStr[16], timeStr[16];
     formatDate(dateStr, sizeof(dateStr), now);
@@ -371,9 +354,7 @@ bool openNewSessionFile(bool isRotation) {
   } else {
     logFile.println(F("# start_time: unknown (no RTC/NTP)"));
   }
-  snprintf(lineFmtBuf, sizeof(lineFmtBuf), "# sample_period_s: %.3f", SENSOR_INTERVAL_MS / 1000.0);
-  logFile.println(lineFmtBuf);
-  snprintf(lineFmtBuf, sizeof(lineFmtBuf), "# log_period_s: %.3f", LOG_INTERVAL_MS / 1000.0);
+  snprintf(lineFmtBuf, sizeof(lineFmtBuf), "# sample_period_s: %.2f", SAMPLE_INTERVAL_MS / 1000.0);
   logFile.println(lineFmtBuf);
   logFile.println(F("# channels: T1_C,T2_C,T3_C,T4_C,T5_C,T6_C"));
   logFile.println(F("# units: C"));
@@ -387,24 +368,31 @@ bool openNewSessionFile(bool isRotation) {
   batchCount  = 0;
   lastBatchMs = millis();
 
-  Serial.print("Opened: "); Serial.println(sessionPath);
+  Serial.print("Opened: ");
+  Serial.println(sessionPath);
   return true;
 }
 
 void closeSessionFile() {
-  if (logFile) { logFile.flush(); logFile.close(); }
+  if (logFile) {
+    logFile.flush();
+    logFile.close();
+  }
 }
 
 bool appendLineToBatch(const float tempsC[6], uint32_t elapsedMs, uint32_t seq) {
   if (batchCount >= BATCH_MAX_LINES) return false;
+
   float elapsedS = elapsedMs / 1000.0f;
   int n = snprintf(lineFmtBuf, sizeof(lineFmtBuf), "%.2f,%lu,", elapsedS, (unsigned long)seq);
+
   for (int i = 0; i < 6; ++i) {
     if (isnan(tempsC[i])) n += snprintf(lineFmtBuf + n, sizeof(lineFmtBuf) - n, "NaN");
     else                  n += snprintf(lineFmtBuf + n, sizeof(lineFmtBuf) - n, "%.2f", tempsC[i]);
     if (i < 5)            n += snprintf(lineFmtBuf + n, sizeof(lineFmtBuf) - n, ",");
   }
   n += snprintf(lineFmtBuf + n, sizeof(lineFmtBuf) - n, "\n");
+
   strncpy(batchBuf[batchCount], lineFmtBuf, sizeof(batchBuf[0]) - 1);
   batchBuf[batchCount][sizeof(batchBuf[0]) - 1] = '\0';
   batchCount++;
@@ -414,8 +402,11 @@ bool appendLineToBatch(const float tempsC[6], uint32_t elapsedMs, uint32_t seq) 
 bool flushBatchToFile() {
   if (!logFile) return false;
   if (batchCount == 0) return true;
+
   for (uint8_t i = 0; i < batchCount; ++i) {
-    if (logFile.print(batchBuf[i]) != (int)strlen(batchBuf[i])) return false;
+    if (logFile.print(batchBuf[i]) != (int)strlen(batchBuf[i])) {
+      return false;
+    }
   }
   logFile.flush();
   batchCount = 0;
@@ -426,8 +417,10 @@ void rotateIfNeeded() {
   if (!logFile) return;
   uint32_t sz = logFile.size();
   if (sz < ROTATE_BYTES) return;
+
   logFile.flush();
   logFile.close();
+
   if (!openNewSessionFile(true)) {
     Serial.println("Rotation failed: could not open new file.");
   } else {
@@ -439,8 +432,14 @@ void rotateIfNeeded() {
 // MAX6675 helper (Adafruit lib)
 // ======================================================================
 bool readMAX6675CelsiusIdx(int idx, float &outC) {
-  float t = TCs[idx]->readCelsius();  // NAN on open-circuit/fault
-  if (!isnan(t) && (t < -10.0f || t > 1100.0f)) { outC = NAN; return true; }
+  // Library returns NAN on open-circuit / fault
+  float t = TCs[idx]->readFahrenheit();
+
+  // Optional sanity clamp (MAX6675 valid 0..~1024 C)
+  if (!isnan(t) && (t < -10.0f || t > 1100.0f)) {
+    outC = NAN;
+    return true;
+  }
   outC = t;
   return true;
 }
@@ -451,7 +450,12 @@ bool readMAX6675CelsiusIdx(int idx, float &outC) {
 bool buttonPressedEdge() {
   bool lvl = digitalRead(PIN_BUTTON);
   uint32_t now = millis();
-  if (lvl != lastBtnLevel) { lastBtnLevel = lvl; lastBtnChangeMs = now; }
+
+  if (lvl != lastBtnLevel) {
+    lastBtnLevel = lvl;
+    lastBtnChangeMs = now;
+  }
+
   if ((now - lastBtnChangeMs) > DEBOUNCE_MS) {
     if (lvl != lastStableBtnLevel) {
       lastStableBtnLevel = lvl;
@@ -466,22 +470,25 @@ void setRecording(bool on) {
     if (!SD.begin(SD_CS, SPI)) {
       Serial.println("SD not ready; cannot start recording.");
       digitalWrite(PIN_LED, LOW);
-      state = IDLE; return;
+      state = IDLE;
+      return;
     }
     if (!openNewSessionFile(false)) {
       Serial.println("Failed to open session file.");
       digitalWrite(PIN_LED, LOW);
-      state = IDLE; return;
+      state = IDLE;
+      return;
     }
-    uint32_t now = millis();
-    recStartMs    = now;
-    lastLogMs     = now;
-    lastBatchMs   = now;
-    batchCount    = 0;
+
+    recStartMs   = millis();
+    lastSampleMs = recStartMs;
+    lastBatchMs  = recStartMs;
+    batchCount   = 0;
 
     digitalWrite(PIN_LED, HIGH);
     state = RECORDING;
-    Serial.print("Recording → "); Serial.println(sessionPath);
+    Serial.print("Recording → ");
+    Serial.println(sessionPath);
   } else {
     if (!flushBatchToFile()) {
       Serial.println("Warning: flush failed on stop; last batch may be lost.");
